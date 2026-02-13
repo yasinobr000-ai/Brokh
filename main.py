@@ -19,9 +19,8 @@ def keep_alive(): Thread(target=run).start()
 # --- CONFIGURATION ---
 APP_ID = '16929'
 WS_URL = f"wss://blue.derivws.com/websockets/v3?app_id={APP_ID}"
-TELEGRAM_TOKEN = '8264292822:AAE_lhhOEBrLEI1z2T1tsX8KBZHL3konF5Q'
+TELEGRAM_TOKEN = '8264292822:AAGSnO_NDcd8m-b9jpojbtu2PuHxsDGQCz8'
 
-# قائمة الـ 15 زوج Forex (Deriv symbols)
 FOREX_PAIRS = [
     "frxAUDCAD", "frxAUDCHF", "frxAUDJPY", "frxAUDNZD", "frxAUDUSD",
     "frxEURAUD", "frxEURCAD", "frxEURCHF", "frxEURGBP", "frxEURJPY",
@@ -47,8 +46,6 @@ class DerivScalper:
 
     def analyze(self, prices):
         if len(prices) < 30: return None
-        
-        # تحويل لشموع (بناءً على إعداداتك: 5 تيكات لكل شمعة)
         candles = []
         for i in range(0, len(prices), 5):
             batch = prices[i:i+5]
@@ -57,7 +54,6 @@ class DerivScalper:
         df = pd.DataFrame(candles)
         support = df['low'].tail(50).min()
         resistance = df['high'].tail(50).max()
-        
         df['rsi'] = calculate_rsi(df['close'], 3)
         curr_rsi = df['rsi'].iloc[-1]
         curr_price = prices[-1]
@@ -75,18 +71,11 @@ class DerivScalper:
 
 # --- BOT HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # تنظيم الأزرار في صفوف (2 في كل صف)
     keyboard = []
     for i in range(0, len(FOREX_PAIRS), 2):
         row = [InlineKeyboardButton(pair.replace("frx", ""), callback_data=pair) for pair in FOREX_PAIRS[i:i+2]]
         keyboard.append(row)
-        
     await update.message.reply_text("📊 اختر زوج العملات للتحليل:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE):
-    """وظيفة لحذف الرسالة بعد الوقت المحدد"""
-    job = context.job
-    await context.bot.delete_message(chat_id=job.chat_id, message_id=job.data)
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -97,35 +86,34 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if res:
         symbol_name = query.data.replace("frx", "")
-        # تطبيق معاييرك السابقة: Multiplier 14, SL/TP $10
         msg_text = (
-            f"🎯 **توصية جديدة**\n"
+            f"🎯 **توصية {symbol_name}**\n"
             f"━━━━━━━━━━━━\n"
-            f"💱 الزوج: {symbol_name}\n"
             f"💰 السعر: {res['p']}\n"
             f"🚦 الإشارة: {res['sig']}\n"
             f"⚡ القوة: {res['str']}%\n"
             f"━━━━━━━━━━━━\n"
-            f"📝 ملاحظة: ستختفي هذه الرسالة بعد 15 ثانية."
+            f"⏱ ستختفي خلال 15 ثانية..."
         )
         
+        # إرسال الرسالة
         sent_msg = await query.message.reply_text(msg_text, parse_mode='Markdown')
         
-        # جدولة حذف الرسالة بعد 15 ثانية
-        context.job_queue.run_once(
-            delete_message_after_delay, 
-            15, 
-            data=sent_msg.message_id, 
-            chat_id=query.message.chat_id
-        )
+        # الانتظار 15 ثانية ثم الحذف
+        async def delayed_delete():
+            await asyncio.sleep(15)
+            try:
+                await context.bot.delete_message(chat_id=query.message.chat_id, message_id=sent_msg.message_id)
+            except:
+                pass # في حال تم حذف الرسالة يدوياً مسبقاً
+
+        # تشغيل مهمة الحذف في الخلفية حتى لا يتوقف البوت عن الرد
+        asyncio.create_task(delayed_delete())
 
 if __name__ == '__main__':
     keep_alive()
-    # إضافة JobQueue للتعامل مع مؤقت الحذف
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle))
-    
-    print("Bot is running...")
+    print("Bot is online...")
     app.run_polling()
