@@ -1,0 +1,5 @@
+python-telegram-bot
+websockets
+pandas
+pandas_ta
+flask
