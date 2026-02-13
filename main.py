@@ -2,73 +2,103 @@ import asyncio
 import json
 import pandas as pd
 import websockets
-import os
 from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import BadRequest
 
-# --- سيرفر وهمي لـ Render ---
+# --- سيرفر Flask لضمان استمرارية العمل على Render ---
 server = Flask('')
 @server.route('/')
-def home(): return "Bot is Online"
+def home(): return "Forex Pro Bot is Online!"
 
 def run(): server.run(host='0.0.0.0', port=8080)
 def keep_alive(): Thread(target=run).start()
 
 # --- الإعدادات ---
 APP_ID = '16929'
-WS_URL = f"wss://blue.derivws.com/websockets/v3?app_id={APP_ID}"
-# التوكن الجديد الذي أرسلته
-TELEGRAM_TOKEN = '8264292822:AAHvxu3_Np_Zbfe3ogDkQGXxA8h5NBzquqM'
+WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
+TELEGRAM_TOKEN = '8264292822:AAF9R8sAsIdlIUEgY9FnzcZc02yecc-_Avo'
 
-FOREX_PAIRS = [
-    ("EUR/USD", "frxEURUSD"), ("GBP/USD", "frxGBPUSD"), ("USD/JPY", "frxUSDJPY"),
-    ("AUD/USD", "frxAUDUSD"), ("USD/CAD", "frxUSDCAD"), ("USD/CHF", "frxUSDCHF"),
-    ("NZD/USD", "frxNZDUSD"), ("EUR/GBP", "frxEURGBP"), ("EUR/JPY", "frxEURJPY"),
-    ("GBP/JPY", "frxGBPJPY"), ("EUR/CHF", "frxEURCHF"), ("AUD/JPY", "frxAUDJPY"),
-    ("GBP/CAD", "frxGBPCAD"), ("AUD/CAD", "frxAUDCAD"), ("XAU/USD", "frxXAUUSD")
+# أزواج العملات (بدون frx هنا ليظهر الاسم نظيفاً للمستخدم)
+FOREX_LIST = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", 
+    "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", 
+    "EURCHF", "AUDJPY", "GBPCAD", "AUDCAD", "XAUUSD"
 ]
 
-# دالة حساب RSI يدوياً (سريعة وخفيفة)
+# دالة حساب RSI يدوية فائقة السرعة
 def calculate_rsi(prices, period=3):
     if len(prices) < period + 1: return 50
-    series = pd.Series(prices)
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-10)
+    s = pd.Series(prices)
+    delta = s.diff()
+    up = delta.clip(lower=0).rolling(window=period).mean()
+    down = -delta.clip(upper=0).rolling(window=period).mean()
+    rs = up / (down + 1e-10)
     return 100 - (100 / (1 + rs.iloc[-1]))
 
-# دالة التحليل الأساسية
-async def get_signal(symbol):
+# دالة جلب البيانات مع إضافة frx وإصلاح مشكلة الـ Error
+async def fetch_deriv_data(symbol):
+    # التأكد من إضافة frx قبل الرمز عند الإرسال لـ Deriv
+    deriv_symbol = f"frx{symbol}"
     try:
-        async with websockets.connect(WS_URL) as ws:
-            await ws.send(json.dumps({"ticks_history": symbol, "count": 1000, "style": "ticks"}))
-            res = json.loads(await ws.recv())
-            prices = res.get('history', {}).get('prices', [])
-            if not prices: return "Error", 0, 0, 0, 0
+        async with websockets.connect(WS_URL, timeout=15) as ws:
+            request = {
+                "ticks_history": deriv_symbol,
+                "count": 1000,
+                "end": "latest",
+                "style": "ticks"
+            }
+            await ws.send(json.dumps(request))
             
-            # حساب الدعم والمقاومة لآخر 200 شمعة (كل شمعة 5 تيكات)
-            df = pd.DataFrame(prices).rolling(window=5).mean().dropna()
-            sup, res_val = df[0].min(), df[0].max()
+            # انتظار الرد مع مهلة زمنية
+            response = await asyncio.wait_for(ws.recv(), timeout=10)
+            data = json.loads(response)
             
-            rsi = calculate_rsi(prices[-30:], 3)
-            curr_p = prices[-1]
-            
-            buffer = (res_val - sup) * 0.05
-            is_safe = (curr_p > sup + buffer) and (curr_p < res_val - buffer)
-            
-            signal = "WAIT ⏳"
-            strength = 0
-            if is_safe:
-                if rsi > 75: signal = "SELL 🔴"; strength = 85
-                elif rsi < 25: signal = "BUY 🟢"; strength = 85
-            return signal, strength, round(sup, 5), round(res_val, 5), curr_p
-    except: return "Connection Error", 0, 0, 0, 0
+            prices = data.get('history', {}).get('prices', [])
+            return prices
+    except Exception as e:
+        print(f"Connection Error for {deriv_symbol}: {e}")
+        return []
 
-# --- وظائف التلغرام ---
+# تحليل الإشارة بناءً على شروطك (1000 تيك للدعم و30 تيك للسيولة)
+def analyze_logic(prices):
+    if not prices or len(prices) < 100: return None
+    
+    df = pd.Series(prices)
+    # دعم ومقاومة من الـ 1000 تيك (حسب طلبك)
+    support = df.min()
+    resistance = df.max()
+    current_price = prices[-1]
+    
+    # تحليل آخر 30 تيك (تقسيم 5 تيك لكل شمعة = 6 شموع)
+    last_30_ticks = prices[-30:]
+    rsi_value = calculate_rsi(last_30_ticks, 3)
+    
+    # شرط القوة والابتعاد عن مناطق الانفجار (Buffer 5%)
+    buffer = (resistance - support) * 0.05
+    is_safe = (current_price > support + buffer) and (current_price < resistance - buffer)
+    
+    signal = "WAIT ⏳"
+    strength = 0
+    
+    if is_safe:
+        if rsi_value > 75: 
+            signal = "SELL 🔴"
+            strength = 85
+        elif rsi_value < 25: 
+            signal = "BUY 🟢"
+            strength = 85
+            
+    return {
+        "sig": signal, 
+        "str": strength, 
+        "sup": round(support, 5), 
+        "res": round(resistance, 5), 
+        "price": current_price
+    }
+
+# --- واجهة التلغرام ---
 async def delete_msg(context, chat_id, msg_id):
     await asyncio.sleep(15)
     try: await context.bot.delete_message(chat_id, msg_id)
@@ -76,38 +106,60 @@ async def delete_msg(context, chat_id, msg_id):
 
 def main_menu():
     keys = []
-    for i in range(0, len(FOREX_PAIRS), 2):
-        row = [InlineKeyboardButton(FOREX_PAIRS[i][0], callback_data=f"sel_{FOREX_PAIRS[i][1]}")]
-        if i+1 < len(FOREX_PAIRS): row.append(InlineKeyboardButton(FOREX_PAIRS[i+1][0], callback_data=f"sel_{FOREX_PAIRS[i+1][1]}"))
+    for i in range(0, len(FOREX_LIST), 2):
+        row = [InlineKeyboardButton(FOREX_LIST[i], callback_data=f"sel_{FOREX_LIST[i]}")]
+        if i+1 < len(FOREX_LIST):
+            row.append(InlineKeyboardButton(FOREX_LIST[i+1], callback_data=f"sel_{FOREX_LIST[i+1]}"))
         keys.append(row)
     return InlineKeyboardMarkup(keys)
 
-async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Forex Scalper Pro**\nSelect pair:", reply_markup=main_menu(), parse_mode='Markdown')
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💎 **Forex Scalper Pro**\nSelect a pair to start analysis:", 
+                                   reply_markup=main_menu(), parse_mode='Markdown')
 
-async def cb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-    await q.answer()
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
     
-    if q.data.startswith("sel_"):
-        sym = q.data.split("_")[1]
-        keys = [[InlineKeyboardButton("🔍 Get Signal", callback_data=f"anz_{sym}")], [InlineKeyboardButton("⬅️ Back", callback_data="home")]]
-        await q.edit_message_text(f"📍 Selected: **{sym}**", reply_markup=InlineKeyboardMarkup(keys), parse_mode='Markdown')
+    if query.data.startswith("sel_"):
+        symbol = query.data.split("_")[1]
+        btn = [[InlineKeyboardButton("🔍 Get Signal", callback_data=f"anz_{symbol}")],
+               [InlineKeyboardButton("⬅️ Back to Menu", callback_data="home")]]
+        await query.edit_message_text(f"📍 Selected Pair: **{symbol}**\nClick below to milk the market:", 
+                                     reply_markup=InlineKeyboardMarkup(btn), parse_mode='Markdown')
     
-    elif q.data.startswith("anz_"):
-        sym = q.data.split("_")[1]
-        sig, st, sup, res, p = await get_signal(sym)
-        text = f"📊 **{sym}**\n💰 Price: `{p}`\n🎯 Signal: **{sig}**\n⚡ Strength: `{st}%`"
-        sent = await c.bot.send_message(q.message.chat_id, text, parse_mode='Markdown')
-        asyncio.create_task(delete_msg(c, q.message.chat_id, sent.message_id))
-    
-    elif q.data == "home":
-        await q.edit_message_text("💎 **Forex Scalper Pro**\nSelect pair:", reply_markup=main_menu(), parse_mode='Markdown')
+    elif query.data.startswith("anz_"):
+        symbol = query.data.split("_")[1]
+        # إظهار رسالة مؤقتة أثناء التحليل
+        temp_msg = await context.bot.send_message(chat_id, f"⏳ Milking data for **{symbol}**...")
+        
+        prices = await fetch_deriv_data(symbol)
+        analysis = analyze_logic(prices)
+        
+        # حذف رسالة الانتظار
+        await context.bot.delete_message(chat_id, temp_msg.message_id)
+        
+        if analysis:
+            text = (f"📊 **Asset:** {symbol}\n"
+                    f"💰 **Current Price:** `{analysis['price']}`\n"
+                    f"🛡️ **Support:** `{analysis['sup']}`\n"
+                    f"🏰 **Resistance:** `{analysis['res']}`\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"🎯 **Signal:** {analysis['sig']}\n"
+                    f"⚡ **Strength:** {analysis['str']}%")
+        else:
+            text = f"❌ **Error:** Could not fetch data for {symbol}. Please try again."
+            
+        sent = await context.bot.send_message(chat_id, text + "\n\n⏱ *Auto-delete in 15s*", parse_mode='Markdown')
+        asyncio.create_task(delete_msg(context, chat_id, sent.message_id))
+
+    elif query.data == "home":
+        await query.edit_message_text("💎 **Forex Scalper Pro**\nSelect a pair:", reply_markup=main_menu(), parse_mode='Markdown')
 
 if __name__ == '__main__':
     keep_alive()
-    # نظام الـ concurrent للتعامل مع آلاف المستخدمين
     app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(cb_handler))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
