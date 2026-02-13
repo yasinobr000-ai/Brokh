@@ -1,7 +1,6 @@
 import asyncio
 import json
 import pandas as pd
-import pandas_ta as ta
 import websockets
 import os
 from flask import Flask
@@ -9,100 +8,85 @@ from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# --- WEB SERVER FOR RENDER (Keep-Alive) ---
+# --- WEB SERVER ---
 server = Flask('')
-
 @server.route('/')
-def home():
-    return "I am alive!"
+def home(): return "Bot is Running!"
 
-def run():
-    server.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+def run(): server.run(host='0.0.0.0', port=8080)
+def keep_alive(): Thread(target=run).start()
 
 # --- CONFIGURATION ---
 APP_ID = '16929'
 WS_URL = f"wss://blue.derivws.com/websockets/v3?app_id={APP_ID}"
 TELEGRAM_TOKEN = '8264292822:AAF1l1iRkWj6-tw-ZmPZkl_NvSxkmrve76Q'
 
-class DerivScalper:
-    def __init__(self):
-        self.tick_limit = 1000
-        self.ticks_per_candle = 5
+# دالة حساب RSI يدوياً لتجنب مشاكل التثبيت
+def calculate_rsi(series, period=3):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
+class DerivScalper:
     async def get_data(self, symbol):
         try:
             async with websockets.connect(WS_URL) as ws:
-                request = {
-                    "ticks_history": symbol,
-                    "adjust_start_time": 1,
-                    "count": self.tick_limit,
-                    "end": "latest",
-                    "style": "ticks"
-                }
-                await ws.send(json.dumps(request))
-                response = await ws.recv()
-                data = json.loads(response)
-                return data.get('history', {}).get('prices', [])
-        except Exception as e:
-            print(f"Error: {e}")
-            return []
+                req = {"ticks_history": symbol, "count": 1000, "end": "latest", "style": "ticks"}
+                await ws.send(json.dumps(req))
+                res = await ws.recv()
+                return json.loads(res).get('history', {}).get('prices', [])
+        except: return []
 
-    def convert_to_candles(self, prices):
-        candles = []
-        for i in range(0, len(prices), self.ticks_per_candle):
-            batch = prices[i:i + self.ticks_per_candle]
-            if len(batch) < self.ticks_per_candle: continue
-            candles.append({'open': batch[0], 'high': max(batch), 'low': min(batch), 'close': batch[-1]})
-        return pd.DataFrame(candles)
-
-    def calculate_strategy(self, prices):
-        if not prices: return None
-        df_large = self.convert_to_candles(prices)
-        support = df_large['low'].tail(100).min()
-        resistance = df_large['high'].tail(100).max()
-        last_30_ticks = prices[-30:]
-        df_signal = self.convert_to_candles(last_30_ticks)
-        df_signal['rsi'] = ta.rsi(df_signal['close'], length=3)
-        current_price = prices[-1]
-        current_rsi = df_signal['rsi'].iloc[-1]
+    def analyze(self, prices):
+        if len(prices) < 30: return None
         
+        # تحويل لشموع (كل 5 تيكات شمعة)
+        candles = []
+        for i in range(0, len(prices), 5):
+            batch = prices[i:i+5]
+            if len(batch)==5: candles.append({'low': min(batch), 'high': max(batch), 'close': batch[-1]})
+        
+        df = pd.DataFrame(candles)
+        support = df['low'].tail(50).min()
+        resistance = df['high'].tail(50).max()
+        
+        # مؤشر RSI لآخر 6 شموع
+        df['rsi'] = calculate_rsi(df['close'], 3)
+        curr_rsi = df['rsi'].iloc[-1]
+        curr_price = prices[-1]
+        
+        # شروط الفلترة
+        buffer = (resistance - support) * 0.05
+        safe = (curr_price > support + buffer) and (curr_price < resistance - buffer)
+        
+        signal = "WAIT"
         strength = 0
-        signal = "NEUTRAL"
-        zone_buffer = (resistance - support) * 0.05
-        is_far_from_sr = (current_price > support + zone_buffer) and (current_price < resistance - zone_buffer)
-        not_broken = max(last_30_ticks) < resistance and min(last_30_ticks) > support
+        if safe:
+            if curr_rsi > 75: signal = "SELL 🔴"; strength = 80
+            elif curr_rsi < 25: signal = "BUY 🟢"; strength = 80
+            
+        return {"sig": signal, "str": strength, "p": curr_price}
 
-        if is_far_from_sr and not_broken:
-            if current_rsi < 30:
-                signal = "BUY 🟢"; strength = 85 if current_rsi < 20 else 70
-            elif current_rsi > 70:
-                signal = "SELL 🔴"; strength = 85 if current_rsi > 80 else 70
+# --- BOT HANDLERS ---
+async def start(update, context):
+    keys = [[InlineKeyboardButton("EUR/USD", callback_data='frxEURUSD')],
+            [InlineKeyboardButton("Volatility 100", callback_data='R_100')]]
+    await update.message.reply_text("Select Pair:", reply_markup=InlineKeyboardMarkup(keys))
 
-        return {"signal": signal, "strength": strength, "support": support, "resistance": resistance, "price": current_price}
-
-# --- TELEGRAM HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("EUR/USD", callback_data='frxEURUSD')],
-                [InlineKeyboardButton("Volatility 100", callback_data='R_100')]]
-    await update.message.reply_text("Select Asset:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle(update, context):
     query = update.callback_query
     await query.answer()
-    scalper = DerivScalper()
-    prices = await scalper.get_data(query.data)
-    res = scalper.calculate_strategy(prices)
+    data = await DerivScalper().get_data(query.data)
+    res = DerivScalper().analyze(data)
     if res:
-        msg = f"🎯 Signal: {res['signal']}\n⚡ Strength: {res['strength']}%\n💰 Price: {res['price']}"
+        msg = f"Symbol: {query.data}\nPrice: {res['p']}\nSignal: {res['sig']}\nStrength: {res['str']}%"
         await query.message.reply_text(msg)
 
 if __name__ == '__main__':
-    keep_alive() # تشغيل السيرفر الوهمي
+    keep_alive()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(CallbackQueryHandler(handle))
     app.run_polling()
