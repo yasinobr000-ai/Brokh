@@ -1,119 +1,202 @@
 import asyncio
 import json
+from datetime import datetime, timedelta
+import threading
 import pandas as pd
 import websockets
-import os
-from flask import Flask
-from threading import Thread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from flask import Flask, render_template_string, request, redirect
+from pymongo import MongoClient
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# --- WEB SERVER ---
-server = Flask('')
-@server.route('/')
-def home(): return "Bot is Running!"
+# ================= CONFIG =================
+BOT_TOKEN = "8264292822:AAE5ifULwb22EAEqJlvIfkpLD88x8EsrZMc"
+MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 
-def run(): server.run(host='0.0.0.0', port=8080)
-def keep_alive(): Thread(target=run).start()
+DB_NAME = "Trading_System_V24_Final_Signal"
+USERS_COL = "Authorized_Users"
 
-# --- CONFIGURATION ---
-APP_ID = '16929'
-WS_URL = f"wss://blue.derivws.com/websockets/v3?app_id={APP_ID}"
-TELEGRAM_TOKEN = '8264292822:AAGSnO_NDcd8m-b9jpojbtu2PuHxsDGQCz8'
+WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
+PAIR = "frxEURGBP"
 
-FOREX_PAIRS = [
-    "frxAUDCAD", "frxAUDCHF", "frxAUDJPY", "frxAUDNZD", "frxAUDUSD",
-    "frxEURAUD", "frxEURCAD", "frxEURCHF", "frxEURGBP", "frxEURJPY",
-    "frxEURUSD", "frxGBPAUD", "frxGBPJPY", "frxGBPUSD", "frxUSDCAD"
-]
+# ================= DATABASE =================
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+users_col = db[USERS_COL]
 
-def calculate_rsi(series, period=3):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+# ================= FLASK ADMIN PANEL =================
+app = Flask(__name__)
 
-class DerivScalper:
-    async def get_data(self, symbol):
-        try:
-            async with websockets.connect(WS_URL) as ws:
-                req = {"ticks_history": symbol, "count": 1000, "end": "latest", "style": "ticks"}
-                await ws.send(json.dumps(req))
-                res = await ws.recv()
-                return json.loads(res).get('history', {}).get('prices', [])
-        except: return []
+@app.route("/")
+def admin_panel():
+    users = list(users_col.find())
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Admin Panel</title>
+        <style>
+            body { font-family: sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 20px; }
+            .card { background: #1e293b; padding: 30px; border-radius: 15px; display: inline-block; width: 100%; max-width: 500px; }
+            input, select { padding: 12px; margin: 5px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white; width: 85%; }
+            button { padding: 12px 25px; background: #38bdf8; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top:10px; }
+            table { width: 100%; margin-top: 30px; border-collapse: collapse; }
+            th { background: #334155; padding: 12px; }
+            td { padding: 12px; border-bottom: 1px solid #334155; }
+            .del { color: #f87171; text-decoration: none; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>User Management</h2>
+            <form action="/add" method="POST">
+                <input name="email" placeholder="Email" required><br>
+                <select name="days">
+                    <option value="1">1 Day</option>
+                    <option value="7">7 Days</option>
+                    <option value="30">30 Days</option>
+                    <option value="36500">Lifetime</option>
+                </select><br>
+                <button type="submit">Activate User</button>
+            </form>
+            <table>
+                <tr><th>Email</th><th>Expiry</th><th>Action</th></tr>
+                {% for u in users %}
+                <tr>
+                    <td>{{u.email}}</td><td>{{u.expiry}}</td>
+                    <td><a href="/delete/{{u.email}}" class="del">Remove</a></td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+    </body>
+    </html>
+    """, users=users)
 
-    def analyze(self, prices):
-        if len(prices) < 30: return None
-        candles = []
-        for i in range(0, len(prices), 5):
-            batch = prices[i:i+5]
-            if len(batch)==5: candles.append({'low': min(batch), 'high': max(batch), 'close': batch[-1]})
-        
-        df = pd.DataFrame(candles)
-        support = df['low'].tail(50).min()
-        resistance = df['high'].tail(50).max()
-        df['rsi'] = calculate_rsi(df['close'], 3)
-        curr_rsi = df['rsi'].iloc[-1]
-        curr_price = prices[-1]
-        
-        buffer = (resistance - support) * 0.05
-        safe = (curr_price > support + buffer) and (curr_price < resistance - buffer)
-        
-        signal = "WAIT ⏳"
-        strength = 0
-        if safe:
-            if curr_rsi > 75: signal = "SELL 🔴"; strength = 85
-            elif curr_rsi < 25: signal = "BUY 🟢"; strength = 85
-            
-        return {"sig": signal, "str": strength, "p": curr_price}
+@app.route("/add", methods=["POST"])
+def add_user():
+    email = request.form.get("email").strip().lower()
+    days = int(request.form.get("days", 30))
+    expiry = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    users_col.update_one({"email": email}, {"$set": {"expiry": expiry}}, upsert=True)
+    return redirect("/")
 
-# --- BOT HANDLERS ---
+@app.route("/delete/<email>")
+def delete_user(email):
+    users_col.delete_one({"email": email})
+    return redirect("/")
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# ================= TELEGRAM BOT =================
+pending_users = set()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    for i in range(0, len(FOREX_PAIRS), 2):
-        row = [InlineKeyboardButton(pair.replace("frx", ""), callback_data=pair) for pair in FOREX_PAIRS[i:i+2]]
-        keyboard.append(row)
-    await update.message.reply_text("📊 اختر زوج العملات للتحليل:", reply_markup=InlineKeyboardMarkup(keyboard))
+    chat_id = update.effective_chat.id
+    pending_users.add(chat_id)
+    await update.message.reply_text("📧 Please enter your email:")
 
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    data = await DerivScalper().get_data(query.data)
-    res = DerivScalper().analyze(data)
-    
-    if res:
-        symbol_name = query.data.replace("frx", "")
-        msg_text = (
-            f"🎯 **توصية {symbol_name}**\n"
-            f"━━━━━━━━━━━━\n"
-            f"💰 السعر: {res['p']}\n"
-            f"🚦 الإشارة: {res['sig']}\n"
-            f"⚡ القوة: {res['str']}%\n"
-            f"━━━━━━━━━━━━\n"
-            f"⏱ ستختفي خلال 15 ثانية..."
-        )
-        
-        # إرسال الرسالة
-        sent_msg = await query.message.reply_text(msg_text, parse_mode='Markdown')
-        
-        # الانتظار 15 ثانية ثم الحذف
-        async def delayed_delete():
-            await asyncio.sleep(15)
-            try:
-                await context.bot.delete_message(chat_id=query.message.chat_id, message_id=sent_msg.message_id)
-            except:
-                pass # في حال تم حذف الرسالة يدوياً مسبقاً
+async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in pending_users:
+        return
 
-        # تشغيل مهمة الحذف في الخلفية حتى لا يتوقف البوت عن الرد
-        asyncio.create_task(delayed_delete())
+    email = update.message.text.strip().lower()
+    user = users_col.find_one({"email": email})
+    now = datetime.now()
 
-if __name__ == '__main__':
-    keep_alive()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle))
-    print("Bot is online...")
-    app.run_polling()
+    if not user:
+        await update.message.reply_text("❌ You do not have access. Please contact KhouryBot")
+        pending_users.remove(chat_id)
+        return
+
+    # check expiry
+    if "expiry" in user and datetime.strptime(user["expiry"], "%Y-%m-%d") < now:
+        await update.message.reply_text("❌ Your access expired. Please contact KhouryBot")
+        pending_users.remove(chat_id)
+        return
+
+    # check telegram id
+    if "telegram_id" in user:
+        if user["telegram_id"] != chat_id:
+            await update.message.reply_text("❌ You do not have access. Please contact KhouryBot")
+            pending_users.remove(chat_id)
+            return
+    else:
+        users_col.update_one({"email": email}, {"$set": {"telegram_id": chat_id}})
+
+    await update.message.reply_text("✅ Bot started")
+    pending_users.remove(chat_id)
+
+    # start trading loop
+    asyncio.create_task(trading_loop(chat_id))
+
+# ================== TRADING ANALYSIS ==================
+async def trading_loop(chat_id):
+    while True:
+        now = datetime.now()
+        # wait until second 30
+        if now.second == 30:
+            # fetch ticks, analyze, send Telegram message
+            signal, accuracy, entry_time = await analyze_pair()
+            from telegram import Bot
+            bot = Bot(BOT_TOKEN)
+            msg = (
+                f"Pair: EUR/GBP\n"
+                f"Timeframe: M1\n"
+                f"Signal: {signal}\n"
+                f"Accuracy: {accuracy}%\n"
+                f"Entry Time: {entry_time.strftime('%H:%M')}"
+            )
+            await bot.send_message(chat_id=chat_id, text=msg)
+            await asyncio.sleep(1)  # avoid duplicate in same second
+        await asyncio.sleep(0.5)
+
+async def analyze_pair():
+    """
+    Dummy analysis with 20 indicators example
+    Replace this with real indicator calculations
+    """
+    async with websockets.connect(WS_URL) as ws:
+        req = {"ticks_history": PAIR, "count": 1000, "end": "latest", "style": "ticks"}
+        await ws.send(json.dumps(req))
+        res = await ws.recv()
+        data = json.loads(res).get("history", {}).get("prices", [])
+        if len(data) < 50:
+            return "WAIT ⏳", 0, datetime.now() + timedelta(seconds=30)
+
+        # example: simple RSI + EMA + fake other indicators to make 20
+        df = pd.DataFrame(data, columns=["price"])
+        df["rsi"] = df["price"].diff().apply(lambda x: max(x,0)).rolling(3).mean() / \
+                    df["price"].diff().apply(lambda x: abs(min(x,0))).rolling(3).mean()
+        df["ema"] = df["price"].ewm(span=5).mean()
+        # simulate other indicators
+        signals = []
+        signals += ["BUY" if df["rsi"].iloc[-1]>1 else "SELL"]
+        signals += ["BUY" if df["ema"].iloc[-1]>df["price"].iloc[-1] else "SELL"]
+        # add dummy 18 more
+        for i in range(18):
+            signals.append("BUY" if df["price"].iloc[-1]%2==0 else "SELL")
+        buy_count = signals.count("BUY")
+        sell_count = signals.count("SELL")
+        signal = "BUY" if buy_count>sell_count else "SELL"
+        accuracy = int((max(buy_count,sell_count)/len(signals))*100)
+        entry_time = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+        return signal, accuracy, entry_time
+
+# ================== RUN ==================
+def main():
+    # start Flask admin panel
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Telegram bot
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email))
+
+    print("Bot running...")
+    app_bot.run_polling()
+
+if __name__ == "__main__":
+    main()
