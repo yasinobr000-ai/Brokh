@@ -1,6 +1,5 @@
-python-telegram-bot==20.7
-flask
-pymongo
-websockets
+python-telegram-bot==20.8
 pandas
-dnspython
+websockets
+pymongo
+flask
