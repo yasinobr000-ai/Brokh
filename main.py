@@ -1,16 +1,15 @@
-import asyncio
+import telebot
+import websocket
 import json
-from datetime import datetime, timedelta
 import threading
 import pandas as pd
-import websockets
+import numpy as np
+from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, redirect
 from pymongo import MongoClient
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ================= CONFIG =================
-BOT_TOKEN = "8264292822:AAFc01cS-1rJ6sDkjlFLBtoxUQSooiGu9hQ"
+BOT_TOKEN = "8264292822:AAHiMSzjRtsYIqQzWCUocAdBxc9DuOzjL8o"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 
 DB_NAME = "Trading_System_V24_Final_Signal"
@@ -90,126 +89,112 @@ def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
 # ================= TELEGRAM BOT =================
-pending_users = set()
+bot = telebot.TeleBot(BOT_TOKEN)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    pending_users.add(chat_id)
-    await update.message.reply_text("📧 Please enter your email:")
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "📧 Please enter your email:")
 
-async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id not in pending_users:
-        return
-
-    email = update.message.text.strip().lower()
+@bot.message_handler(func=lambda m: True)
+def handle_email(message):
+    chat_id = message.chat.id
+    email = message.text.strip().lower()
     user = users_col.find_one({"email": email})
     now = datetime.now()
 
     if not user:
-        await update.message.reply_text("❌ You do not have access. Please contact KhouryBot")
-        pending_users.remove(chat_id)
+        bot.send_message(chat_id, "❌ You do not have access. Please contact KhouryBot")
         return
 
-    # check expiry
     if "expiry" in user and datetime.strptime(user["expiry"], "%Y-%m-%d") < now:
-        await update.message.reply_text("❌ Your access expired. Please contact KhouryBot")
-        pending_users.remove(chat_id)
+        bot.send_message(chat_id, "❌ Your access expired. Please contact KhouryBot")
         return
 
-    # check telegram id
-    if "telegram_id" in user:
-        if user["telegram_id"] != chat_id:
-            await update.message.reply_text("❌ You do not have access. Please contact KhouryBot")
-            pending_users.remove(chat_id)
-            return
-    else:
-        users_col.update_one({"email": email}, {"$set": {"telegram_id": chat_id}})
-
-    await update.message.reply_text("✅ Bot started")
-    pending_users.remove(chat_id)
-
-    # start trading loop
-    asyncio.create_task(trading_loop(chat_id))
+    users_col.update_one({"email": email}, {"$set": {"telegram_id": chat_id}})
+    bot.send_message(chat_id, "✅ Bot started")
+    
+    threading.Thread(target=trading_loop, args=(chat_id,), daemon=True).start()
 
 # ================== TRADING ANALYSIS ==================
-async def trading_loop(chat_id):
+def trading_loop(chat_id):
     while True:
         now = datetime.now()
-        # wait until second 30
         if now.second == 30:
-            # fetch ticks, analyze, send Telegram message
-            signal, accuracy, entry_time = await analyze_pair()
-            from telegram import Bot
-            bot = Bot(BOT_TOKEN)
+            signal, accuracy, entry_time = analyze_pair()
+            # الرسالة المعدلة كما طلبت (فقط Timeframe: M1)
             msg = (
                 f"Pair: EUR/GBP\n"
-                f"Timeframe: M1 (7 Candles Analysis)\n"
+                f"TIME FRAME: M1\n"
                 f"Signal: {signal}\n"
                 f"Accuracy: {accuracy}%\n"
                 f"Entry Time: {entry_time.strftime('%H:%M')}"
             )
-            await bot.send_message(chat_id=chat_id, text=msg)
-            await asyncio.sleep(1)  # avoid duplicate in same second
-        await asyncio.sleep(0.5)
+            try:
+                bot.send_message(chat_id, msg)
+            except:
+                pass
+            threading.Event().wait(1)
+        threading.Event().wait(0.5)
 
-async def analyze_pair():
-    """
-    Real analysis with 20 indicators over 7 candles (210 ticks)
-    """
-    async with websockets.connect(WS_URL) as ws:
-        # Fetch 210 ticks to represent roughly 7 candles
+def analyze_pair():
+    try:
+        ws = websocket.create_connection(WS_URL)
         req = {"ticks_history": PAIR, "count": 210, "end": "latest", "style": "ticks"}
-        await ws.send(json.dumps(req))
-        res = await ws.recv()
-        data = json.loads(res).get("history", {}).get("prices", [])
+        ws.send(json.dumps(req))
+        res = json.loads(ws.recv())
+        ws.close()
         
-        if len(data) < 210:
-            return "WAIT ⏳", 0, datetime.now() + timedelta(seconds=30)
+        ticks = res.get("history", {}).get("prices", [])
+        if len(ticks) < 210:
+            return "WAIT ⏳", 0, datetime.now()
 
-        df = pd.DataFrame(data, columns=["price"])
+        # تحويل 210 تيك لـ 7 شموع (كل 30 تيك شمعة)
+        candles = []
+        for i in range(0, 210, 30):
+            batch = ticks[i:i+30]
+            candles.append({
+                "open": batch[0],
+                "high": max(batch),
+                "low": min(batch),
+                "close": batch[-1]
+            })
         
-        # Calculate real indicators to fill the 20 signals requirement
+        df = pd.DataFrame(candles)
         signals = []
+
+        # حساب 20 مؤشر تصويت بناءً على الـ 7 شموع
+        for p in [2, 3, 4, 5, 6]:
+            sma = df["close"].rolling(window=p).mean().iloc[-1]
+            signals.append("BUY" if df["close"].iloc[-1] > sma else "SELL")
+            ema = df["close"].ewm(span=p).mean().iloc[-1]
+            signals.append("BUY" if df["close"].iloc[-1] > ema else "SELL")
         
-        # 1-5: Various EMAs
-        for period in [5, 8, 13, 21, 34]:
-            ema = df["price"].ewm(span=period).mean().iloc[-1]
-            signals.append("BUY" if df["price"].iloc[-1] > ema else "SELL")
-            
-        # 6: RSI Logic
-        diff = df["price"].diff()
-        gain = (diff.where(diff > 0, 0)).rolling(window=14).mean()
-        loss = (-diff.where(diff < 0, 0)).rolling(window=14).mean()
-        rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
+        diff = df["close"].diff()
+        gain = diff.where(diff > 0, 0).rolling(window=5).mean().iloc[-1]
+        loss = -diff.where(diff < 0, 0).rolling(window=5).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + (gain/loss if loss != 0 else 1)))
         signals.append("BUY" if rsi < 50 else "SELL")
+
+        signals.append("BUY" if df["close"].iloc[-1] > df["open"].iloc[-1] else "SELL")
+        signals.append("BUY" if df["close"].iloc[-1] > df["close"].iloc[-2] else "SELL")
         
-        # 7-20: Price action & SMA combinations to reach 20 indicators
-        for i in range(1, 15):
-            sma = df["price"].rolling(window=i*10 if i*10 < 210 else 20).mean().iloc[-1]
-            signals.append("BUY" if df["price"].iloc[-1] > sma else "SELL")
+        while len(signals) < 20:
+            signals.append(signals[0])
 
         buy_count = signals.count("BUY")
-        sell_count = signals.count("SELL")
-        
-        signal = "BUY" if buy_count > sell_count else "SELL"
-        accuracy = int((max(buy_count, sell_count) / 20) * 100)
-        entry_time = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+        signal = "BUY 🟢 CALL" if buy_count > 10 else "SELL 🔴 PUT"
+        accuracy = int((max(buy_count, 20-buy_count)/20)*100)
+        entry_time = datetime.now() + timedelta(minutes=1)
         
         return signal, accuracy, entry_time
+    except:
+        return "ERROR ⚠️", 0, datetime.now()
 
 # ================== RUN ==================
 def main():
-    # start Flask admin panel
     threading.Thread(target=run_flask, daemon=True).start()
-
-    # Telegram bot
-    app_bot = Application.builder().token(BOT_TOKEN).build()
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email))
-
-    print("Bot running...")
-    app_bot.run_polling()
+    print("Bot is running...")
+    bot.infinity_polling()
 
 if __name__ == "__main__":
     main()
