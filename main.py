@@ -1,30 +1,42 @@
 import telebot
+from telebot import types
 import websocket
 import json
 import threading
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import time
 from flask import Flask, render_template_string, request, redirect
 from pymongo import MongoClient
 
-# ================= CONFIG =================
-BOT_TOKEN = "8264292822:AAHiMSzjRtsYIqQzWCUocAdBxc9DuOzjL8o"
+# ================= CONFIG (إعدادات البوت والبيانات) =================
+BOT_TOKEN = "8264292822:AAENs24FD6QHGu_bgEBn1CkE4ojN7zruA1Q"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 
 DB_NAME = "Trading_System_V24_Final_Signal"
 USERS_COL = "Authorized_Users"
-
 WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
-PAIR = "frxEURGBP"
+
+# قائمة الـ 20 زوج فوركس
+FOREX_PAIRS = {
+    "EUR/USD": "frxEURUSD", "GBP/USD": "frxGBPUSD", "USD/JPY": "frxUSDJPY",
+    "EUR/GBP": "frxEURGBP", "AUD/USD": "frxAUDUSD", "USD/CHF": "frxUSDCHF",
+    "USD/CAD": "frxUSDCAD", "NZD/USD": "frxNZDUSD", "EUR/JPY": "frxEURJPY",
+    "GBP/JPY": "frxGBPJPY", "EUR/AUD": "frxEURAUD", "GBP/AUD": "frxGBPAUD",
+    "AUD/JPY": "frxAUDJPY", "EUR/CAD": "frxEURCAD", "GBP/CAD": "frxGBPCAD",
+    "AUD/CAD": "frxAUDCAD", "EUR/NZD": "frxEURNZD", "AUD/NZD": "frxAUDNZD",
+    "GBP/CHF": "frxGBPCHF", "Gold/USD": "frxXAUUSD"
+}
 
 # ================= DATABASE =================
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 users_col = db[USERS_COL]
 
-# ================= FLASK ADMIN PANEL =================
+# ================= FLASK ADMIN PANEL (نفس تصميمك) =================
 app = Flask(__name__)
+user_states = {} # لتخزين حالة كل مستخدم (الزوج الحالي، حالة التشغيل، آخر إشارة)
 
 @app.route("/")
 def admin_panel():
@@ -61,10 +73,7 @@ def admin_panel():
             <table>
                 <tr><th>Email</th><th>Expiry</th><th>Action</th></tr>
                 {% for u in users %}
-                <tr>
-                    <td>{{u.email}}</td><td>{{u.expiry}}</td>
-                    <td><a href="/delete/{{u.email}}" class="del">Remove</a></td>
-                </tr>
+                <tr><td>{{u.email}}</td><td>{{u.expiry}}</td><td><a href="/delete/{{u.email}}" class="del">Remove</a></td></tr>
                 {% endfor %}
             </table>
         </div>
@@ -88,113 +97,132 @@ def delete_user(email):
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
-# ================= TELEGRAM BOT =================
+# ================= TELEGRAM BOT (START & STOP & CHANGE PAIR) =================
 bot = telebot.TeleBot(BOT_TOKEN)
+
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("START 🚀", "STOP 🛑")
+    markup.add("CHANGE PAIR 🔄")
+    return markup
 
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.reply_to(message, "📧 Please enter your email:")
 
-@bot.message_handler(func=lambda m: True)
-def handle_email(message):
-    chat_id = message.chat.id
+@bot.message_handler(func=lambda m: "@" in m.text)
+def handle_auth(message):
     email = message.text.strip().lower()
     user = users_col.find_one({"email": email})
-    now = datetime.now()
+    if user:
+        user_states[message.chat.id] = {'running': False, 'pair': 'frxEURUSD', 'pair_name': 'EUR/USD', 'last_signal': ''}
+        bot.send_message(message.chat.id, "✅ Access Granted!", reply_markup=main_keyboard())
+    else:
+        bot.send_message(message.chat.id, "❌ Not authorized.")
 
-    if not user:
-        bot.send_message(chat_id, "❌ You do not have access. Please contact KhouryBot")
-        return
+@bot.message_handler(func=lambda m: m.text == "START 🚀")
+def bot_on(message):
+    if message.chat.id in user_states:
+        user_states[message.chat.id]['running'] = True
+        bot.send_message(message.chat.id, f"🚀 Bot Started on {user_states[message.chat.id]['pair_name']}")
+        threading.Thread(target=trading_loop, args=(message.chat.id,), daemon=True).start()
 
-    if "expiry" in user and datetime.strptime(user["expiry"], "%Y-%m-%d") < now:
-        bot.send_message(chat_id, "❌ Your access expired. Please contact KhouryBot")
-        return
+@bot.message_handler(func=lambda m: m.text == "STOP 🛑")
+def bot_off(message):
+    if message.chat.id in user_states:
+        user_states[message.chat.id]['running'] = False
+        bot.send_message(message.chat.id, "🛑 Bot Stopped.")
 
-    users_col.update_one({"email": email}, {"$set": {"telegram_id": chat_id}})
-    bot.send_message(chat_id, "✅ Bot started")
-    
-    threading.Thread(target=trading_loop, args=(chat_id,), daemon=True).start()
+@bot.message_handler(func=lambda m: m.text == "CHANGE PAIR 🔄")
+def pairs_menu(message):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    btns = [types.InlineKeyboardButton(name, callback_data=f"set_{code}_{name}") for name, code in FOREX_PAIRS.items()]
+    markup.add(*btns)
+    bot.send_message(message.chat.id, "📊 Select Forex Pair:", reply_markup=markup)
 
-# ================== TRADING ANALYSIS ==================
-def trading_loop(chat_id):
-    while True:
-        now = datetime.now()
-        if now.second == 30:
-            signal, accuracy, entry_time = analyze_pair()
-            # الرسالة المعدلة كما طلبت (فقط Timeframe: M1)
-            msg = (
-                f"Pair: EUR/GBP\n"
-                f"TIME FRAME: M1\n"
-                f"Signal: {signal}\n"
-                f"Accuracy: {accuracy}%\n"
-                f"Entry Time: {entry_time.strftime('%H:%M')}"
-            )
-            try:
-                bot.send_message(chat_id, msg)
-            except:
-                pass
-            threading.Event().wait(1)
-        threading.Event().wait(0.5)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_"))
+def set_pair(call):
+    _, code, name = call.data.split("_")
+    user_states[call.message.chat.id].update({'pair': code, 'pair_name': name})
+    bot.answer_callback_query(call.id, f"Pair: {name}")
+    bot.edit_message_text(f"🎯 Current Pair: {name}", call.message.chat.id, call.message.message_id)
 
-def analyze_pair():
+# ================== TRADING ANALYSIS (الاستراتيجية المتقدمة) ==================
+
+def analyze_pair(chat_id):
     try:
+        state = user_states[chat_id]
         ws = websocket.create_connection(WS_URL)
-        req = {"ticks_history": PAIR, "count": 210, "end": "latest", "style": "ticks"}
-        ws.send(json.dumps(req))
+        # جلب 3000 تيك للتحليل
+        ws.send(json.dumps({"ticks_history": state['pair'], "count": 3000, "end": "latest", "style": "ticks"}))
         res = json.loads(ws.recv())
         ws.close()
         
         ticks = res.get("history", {}).get("prices", [])
-        if len(ticks) < 210:
-            return "WAIT ⏳", 0, datetime.now()
+        if len(ticks) < 3000: return None, 0
 
-        # تحويل 210 تيك لـ 7 شموع (كل 30 تيك شمعة)
-        candles = []
-        for i in range(0, 210, 30):
-            batch = ticks[i:i+30]
-            candles.append({
-                "open": batch[0],
-                "high": max(batch),
-                "low": min(batch),
-                "close": batch[-1]
-            })
-        
-        df = pd.DataFrame(candles)
+        # 1. جلب مناطق S/R من 3000 تيك (كل 30 تيك شمعة = 100 شمعة)
+        candles_sr = [{"high": max(ticks[i:i+30]), "low": min(ticks[i:i+30])} for i in range(0, 3000, 30)]
+        df_sr = pd.DataFrame(candles_sr)
+        support, resistance = df_sr['low'].min(), df_sr['high'].max()
+
+        # 2. تحليل آخر 60 تيك (كل 5 تيك شمعة = 12 شمعة)
+        recent_ticks = ticks[-60:]
+        fast_candles = [{"close": recent_ticks[i:i+5][-1], "open": recent_ticks[i:i+5][0]} for i in range(0, 60, 5)]
+        df_fast = pd.DataFrame(fast_candles)
+        curr_price = ticks[-1]
+
+        # 3. حساب 20 مؤشر (SMA, EMA, Price Action)
         signals = []
-
-        # حساب 20 مؤشر تصويت بناءً على الـ 7 شموع
-        for p in [2, 3, 4, 5, 6]:
-            sma = df["close"].rolling(window=p).mean().iloc[-1]
-            signals.append("BUY" if df["close"].iloc[-1] > sma else "SELL")
-            ema = df["close"].ewm(span=p).mean().iloc[-1]
-            signals.append("BUY" if df["close"].iloc[-1] > ema else "SELL")
+        for p in [2, 3, 4, 5]:
+            ma = df_fast['close'].rolling(window=p).mean().iloc[-1]
+            signals.append("BUY" if curr_price > ma else "SELL")
+            ema = df_fast['close'].ewm(span=p).mean().iloc[-1]
+            signals.append("BUY" if curr_price > ema else "SELL")
         
-        diff = df["close"].diff()
-        gain = diff.where(diff > 0, 0).rolling(window=5).mean().iloc[-1]
-        loss = -diff.where(diff < 0, 0).rolling(window=5).mean().iloc[-1]
-        rsi = 100 - (100 / (1 + (gain/loss if loss != 0 else 1)))
-        signals.append("BUY" if rsi < 50 else "SELL")
-
-        signals.append("BUY" if df["close"].iloc[-1] > df["open"].iloc[-1] else "SELL")
-        signals.append("BUY" if df["close"].iloc[-1] > df["close"].iloc[-2] else "SELL")
-        
-        while len(signals) < 20:
-            signals.append(signals[0])
+        for i in range(1, 13):
+            signals.append("BUY" if df_fast['close'].iloc[-1] > df_fast['close'].iloc[-i] else "SELL")
 
         buy_count = signals.count("BUY")
-        signal = "BUY 🟢 CALL" if buy_count > 10 else "SELL 🔴 PUT"
         accuracy = int((max(buy_count, 20-buy_count)/20)*100)
-        entry_time = datetime.now() + timedelta(minutes=1)
+
+        # 4. الشروط الصارمة
+        last_30_min, last_30_max = min(ticks[-30:]), max(ticks[-30:])
         
-        return signal, accuracy, entry_time
+        if accuracy >= 75:
+            # السعر بعيد عن المناطق ولم يخترقها في آخر 30 تيك
+            if last_30_max < resistance and last_30_min > support:
+                if abs(curr_price - resistance) > 0.00005 and abs(curr_price - support) > 0.00005:
+                    final_sig = "BUY 🟢 CALL" if buy_count > 10 else "SELL 🔴 PUT"
+                    
+                    # منع التكرار (ما يبعت SELL مرتين ورا بعض)
+                    if final_sig != state['last_signal']:
+                        return final_sig, accuracy
+        return None, 0
     except:
-        return "ERROR ⚠️", 0, datetime.now()
+        return None, 0
+
+def trading_loop(chat_id):
+    while user_states.get(chat_id, {}).get('running'):
+        now = datetime.now()
+        if now.second == 30:
+            signal, accuracy = analyze_pair(chat_id)
+            if signal:
+                user_states[chat_id]['last_signal'] = signal
+                msg = (f"Pair: {user_states[chat_id]['pair_name']}\n"
+                       f"TIME FRAME: M1\n"
+                       f"Signal: {signal}\n"
+                       f"Accuracy: {accuracy}%\n"
+                       f"Entry Time: {(datetime.now() + timedelta(minutes=1)).strftime('%H:%M')}")
+                try: bot.send_message(chat_id, msg)
+                except: pass
+                
+                time.sleep(70) # ينام 70 ثانية
+                continue
+        time.sleep(0.5)
 
 # ================== RUN ==================
-def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    print("Bot is running...")
-    bot.infinity_polling()
-
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("Khoury Trading Bot is Online...")
+    bot.infinity_polling()
