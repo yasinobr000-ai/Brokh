@@ -3,6 +3,5 @@ pyTelegramBotAPI
 websocket-client
 pymongo
 pandas
-pandas_ta
 datetime
 numpy
