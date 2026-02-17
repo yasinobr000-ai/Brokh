@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: telegram-20indicators-bot
+    env: python
+    startCommand: python app.py
+    plan: free
