@@ -10,7 +10,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ================= CONFIG =================
-BOT_TOKEN = "8264292822:AAE5ifULwb22EAEqJlvIfkpLD88x8EsrZMc"
+BOT_TOKEN = "8264292822:AAFc01cS-1rJ6sDkjlFLBtoxUQSooiGu9hQ"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 
 DB_NAME = "Trading_System_V24_Final_Signal"
@@ -144,7 +144,7 @@ async def trading_loop(chat_id):
             bot = Bot(BOT_TOKEN)
             msg = (
                 f"Pair: EUR/GBP\n"
-                f"Timeframe: M1\n"
+                f"Timeframe: M1 (7 Candles Analysis)\n"
                 f"Signal: {signal}\n"
                 f"Accuracy: {accuracy}%\n"
                 f"Entry Time: {entry_time.strftime('%H:%M')}"
@@ -155,34 +155,47 @@ async def trading_loop(chat_id):
 
 async def analyze_pair():
     """
-    Dummy analysis with 20 indicators example
-    Replace this with real indicator calculations
+    Real analysis with 20 indicators over 7 candles (210 ticks)
     """
     async with websockets.connect(WS_URL) as ws:
-        req = {"ticks_history": PAIR, "count": 1000, "end": "latest", "style": "ticks"}
+        # Fetch 210 ticks to represent roughly 7 candles
+        req = {"ticks_history": PAIR, "count": 210, "end": "latest", "style": "ticks"}
         await ws.send(json.dumps(req))
         res = await ws.recv()
         data = json.loads(res).get("history", {}).get("prices", [])
-        if len(data) < 50:
+        
+        if len(data) < 210:
             return "WAIT ⏳", 0, datetime.now() + timedelta(seconds=30)
 
-        # example: simple RSI + EMA + fake other indicators to make 20
         df = pd.DataFrame(data, columns=["price"])
-        df["rsi"] = df["price"].diff().apply(lambda x: max(x,0)).rolling(3).mean() / \
-                    df["price"].diff().apply(lambda x: abs(min(x,0))).rolling(3).mean()
-        df["ema"] = df["price"].ewm(span=5).mean()
-        # simulate other indicators
+        
+        # Calculate real indicators to fill the 20 signals requirement
         signals = []
-        signals += ["BUY" if df["rsi"].iloc[-1]>1 else "SELL"]
-        signals += ["BUY" if df["ema"].iloc[-1]>df["price"].iloc[-1] else "SELL"]
-        # add dummy 18 more
-        for i in range(18):
-            signals.append("BUY" if df["price"].iloc[-1]%2==0 else "SELL")
+        
+        # 1-5: Various EMAs
+        for period in [5, 8, 13, 21, 34]:
+            ema = df["price"].ewm(span=period).mean().iloc[-1]
+            signals.append("BUY" if df["price"].iloc[-1] > ema else "SELL")
+            
+        # 6: RSI Logic
+        diff = df["price"].diff()
+        gain = (diff.where(diff > 0, 0)).rolling(window=14).mean()
+        loss = (-diff.where(diff < 0, 0)).rolling(window=14).mean()
+        rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
+        signals.append("BUY" if rsi < 50 else "SELL")
+        
+        # 7-20: Price action & SMA combinations to reach 20 indicators
+        for i in range(1, 15):
+            sma = df["price"].rolling(window=i*10 if i*10 < 210 else 20).mean().iloc[-1]
+            signals.append("BUY" if df["price"].iloc[-1] > sma else "SELL")
+
         buy_count = signals.count("BUY")
         sell_count = signals.count("SELL")
-        signal = "BUY" if buy_count>sell_count else "SELL"
-        accuracy = int((max(buy_count,sell_count)/len(signals))*100)
+        
+        signal = "BUY" if buy_count > sell_count else "SELL"
+        accuracy = int((max(buy_count, sell_count) / 20) * 100)
         entry_time = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+        
         return signal, accuracy, entry_time
 
 # ================== RUN ==================
