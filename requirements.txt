@@ -1,5 +1,8 @@
-python-telegram-bot==20.8
-pandas
-websockets
+Flask
+pyTelegramBotAPI
+websocket-client
 pymongo
-flask
+pandas
+pandas_ta
+datetime
+numpy
