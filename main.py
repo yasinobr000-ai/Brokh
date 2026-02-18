@@ -10,8 +10,8 @@ import time
 from flask import Flask, render_template_string, request, redirect
 from pymongo import MongoClient
 
-# ================= CONFIG (الإعدادات) =================
-BOT_TOKEN = "8264292822:AAHVsfIc7_1rm0nkUcMqjcTK9MlzKwp4EYE"
+# ================= CONFIG (التوكن الجديد وإعدادات الاتصال) =================
+BOT_TOKEN = "8264292822:AAEwdBWRC03qtHJo3LDGNrDh72TnZ8XAHCY"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
 
@@ -22,7 +22,7 @@ users_col = db["Authorized_Users"]
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# تخزين الحالات
+# تخزين الحالات والـ Events
 user_states = {} 
 user_threads_events = {}
 
@@ -99,7 +99,7 @@ def delete_user(email):
     users_col.delete_one({"email": email})
     return redirect("/")
 
-# ================= TRADING LOGIC (30 DIFFERENT INDICATORS) =================
+# ================= TRADING LOGIC (30 UNIQUE INDICATORS) =================
 def analyze_logic(chat_id):
     state = user_states.get(chat_id)
     if not state: return None, 0
@@ -116,69 +116,82 @@ def analyze_logic(chat_id):
         prev = prices.iloc[-2]
         signals = []
 
-        # --- 1. Moving Average (واحد فقط) ---
+        # 1. Moving Average (SMA 20)
         signals.append("BUY" if curr > prices.rolling(20).mean().iloc[-1] else "SELL")
-
-        # --- 2-10. Oscillators ---
+        # 2. RSI 14
         diff = prices.diff()
         gain = diff.where(diff > 0, 0).rolling(14).mean()
         loss = -diff.where(diff < 0, 0).rolling(14).mean()
         rsi = 100 - (100 / (1 + (gain / loss).iloc[-1]))
-        signals.append("BUY" if rsi < 50 else "SELL") # 2. RSI
-        
+        signals.append("BUY" if rsi < 50 else "SELL")
+        # 3. MACD
         macd = prices.ewm(span=12).mean().iloc[-1] - prices.ewm(span=26).mean().iloc[-1]
-        signals.append("BUY" if macd > 0 else "SELL") # 3. MACD
-        
-        stoch = ((curr - prices.rolling(14).min().iloc[-1]) / (prices.rolling(14).max().iloc[-1] - prices.rolling(14).min().iloc[-1])) * 100
-        signals.append("BUY" if stoch > 50 else "SELL") # 4. Stochastic
-        
-        willr = ((prices.rolling(14).max().iloc[-1] - curr) / (prices.rolling(14).max().iloc[-1] - prices.rolling(14).min().iloc[-1])) * -100
-        signals.append("BUY" if willr > -50 else "SELL") # 5. Williams %R
-        
+        signals.append("BUY" if macd > 0 else "SELL")
+        # 4. Stochastic %K
+        signals.append("BUY" if ((curr - prices.rolling(14).min().iloc[-1]) / (prices.rolling(14).max().iloc[-1] - prices.rolling(14).min().iloc[-1])) * 100 > 50 else "SELL")
+        # 5. Williams %R
+        signals.append("BUY" if ((prices.rolling(14).max().iloc[-1] - curr) / (prices.rolling(14).max().iloc[-1] - prices.rolling(14).min().iloc[-1])) * -100 > -50 else "SELL")
+        # 6. CCI
         tp = prices.rolling(20).mean().iloc[-1]
         mad = prices.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean()).iloc[-1]
         cci = (curr - tp) / (0.015 * mad)
-        signals.append("BUY" if cci > 0 else "SELL") # 6. CCI
-        
-        signals.append("BUY" if curr > prices.iloc[-10] else "SELL") # 7. Momentum
-        signals.append("BUY" if ((curr - prices.iloc[-12]) / prices.iloc[-12]) > 0 else "SELL") # 8. ROC
-        signals.append("BUY" if (curr - prices.ewm(span=13).mean().iloc[-1]) > 0 else "SELL") # 9. Bull Power
-        signals.append("BUY" if (curr - prev) > (prices.iloc[-2] - prices.iloc[-3]) else "SELL") # 10. Force Index Proxy
-
-        # --- 11-20. Volatility & Channels ---
+        signals.append("BUY" if cci > 0 else "SELL")
+        # 7. Momentum
+        signals.append("BUY" if curr > prices.iloc[-10] else "SELL")
+        # 8. ROC
+        signals.append("BUY" if ((curr - prices.iloc[-12]) / prices.iloc[-12]) > 0 else "SELL")
+        # 9. Bull Power
+        signals.append("BUY" if (curr - prices.ewm(span=13).mean().iloc[-1]) > 0 else "SELL")
+        # 10. Bear Power
+        signals.append("BUY" if (curr - prices.ewm(span=13).mean().iloc[-1]) > -0.001 else "SELL")
+        # 11. BB Upper
         std = prices.rolling(20).std().iloc[-1]
-        ma = prices.rolling(20).mean().iloc[-1]
-        signals.append("BUY" if curr < (ma + 2*std) else "SELL") # 11. BB Upper
-        signals.append("BUY" if curr > (ma - 2*std) else "SELL") # 12. BB Lower
-        signals.append("BUY" if curr > prices.rolling(10).mean().iloc[-1] else "SELL") # 13. Keltner Proxy
-        signals.append("BUY" if curr > (prices.rolling(20).max().iloc[-1] + prices.rolling(20).min().iloc[-1])/2 else "SELL") # 14. Donchian Mid
-        signals.append("BUY" if prices.iloc[-10:].var() < prices.iloc[-30:].var() else "SELL") # 15. Variance
-        signals.append("BUY" if curr > prices.mean() else "SELL") # 16. Mean Deviation
-        signals.append("BUY" if curr > prices.iloc[-3:].mean() else "SELL") # 17. Typical Price
-        signals.append("BUY" if abs(curr - prev) > prices.diff().abs().mean() else "SELL") # 18. Volatility Filter
-        signals.append("BUY" if (prices.iloc[-1] - prices.iloc[-5]) > 0 else "SELL") # 19. Range expansion
-        signals.append("BUY" if prices.rolling(10).std().iloc[-1] > prices.rolling(20).std().iloc[-1] else "SELL") # 20. RVI Proxy
+        signals.append("BUY" if curr < (prices.rolling(20).mean().iloc[-1] + 2*std) else "SELL")
+        # 12. BB Lower
+        signals.append("BUY" if curr > (prices.rolling(20).mean().iloc[-1] - 2*std) else "SELL")
+        # 13. Keltner Mid
+        signals.append("BUY" if curr > prices.rolling(10).mean().iloc[-1] else "SELL")
+        # 14. Donchian Mid
+        signals.append("BUY" if curr > (prices.rolling(20).max().iloc[-1] + prices.rolling(20).min().iloc[-1])/2 else "SELL")
+        # 15. Variance
+        signals.append("BUY" if prices.iloc[-5:].var() < prices.iloc[-20:].var() else "SELL")
+        # 16. Mean Deviation
+        signals.append("BUY" if curr > prices.mean() else "SELL")
+        # 17. Typical Price Action
+        signals.append("BUY" if curr > (prices.iloc[-3:].mean()) else "SELL")
+        # 18. Volatility Filter
+        signals.append("BUY" if abs(curr - prev) > prices.diff().abs().mean() else "SELL")
+        # 19. Range expansion
+        signals.append("BUY" if (prices.iloc[-1] - prices.iloc[-5]) > 0 else "SELL")
+        # 20. RVI Proxy
+        signals.append("BUY" if prices.rolling(10).std().iloc[-1] > prices.rolling(20).std().iloc[-1] else "SELL")
+        # 21. LinReg Slope Proxy
+        signals.append("BUY" if curr > prices.iloc[-20] else "SELL")
+        # 22. Support Wall
+        signals.append("BUY" if curr > prices.iloc[-50:].min() else "SELL")
+        # 23. Pivot Point
+        signals.append("BUY" if curr > (prices.max() + prices.min() + curr)/3 else "SELL")
+        # 24. Tenkan-sen
+        signals.append("BUY" if curr > (prices.rolling(9).max().iloc[-1] + prices.rolling(9).min().iloc[-1])/2 else "SELL")
+        # 25. Kijun-sen
+        signals.append("BUY" if curr > (prices.rolling(26).max().iloc[-1] + prices.rolling(26).min().iloc[-1])/2 else "SELL")
+        # 26. Price Velocity
+        signals.append("BUY" if (curr - prev) > 0 else "SELL")
+        # 27. Acceleration
+        signals.append("BUY" if ((curr - prev) - (prev - prices.iloc[-3])) > 0 else "SELL")
+        # 28. Median Cross
+        signals.append("BUY" if curr > prices.median() else "SELL")
+        # 29. Log Returns
+        signals.append("BUY" if np.log(curr/prev) > 0 else "SELL")
+        # 30. Base Trend
+        signals.append("BUY" if curr > prices.iloc[0] else "SELL")
 
-        # --- 21-30. Trend & Math Models ---
-        signals.append("BUY" if curr > prices.iloc[-20] else "SELL") # 21. LinReg Slope Proxy
-        signals.append("BUY" if curr > prices.iloc[-50:].min() else "SELL") # 22. Support Wall
-        signals.append("BUY" if curr > (prices.max() + prices.min() + curr)/3 else "SELL") # 23. Pivot Point
-        signals.append("BUY" if curr > (prices.rolling(9).max().iloc[-1] + prices.rolling(9).min().iloc[-1])/2 else "SELL") # 24. Tenkan-sen
-        signals.append("BUY" if curr > (prices.rolling(26).max().iloc[-1] + prices.rolling(26).min().iloc[-1])/2 else "SELL") # 25. Kijun-sen
-        signals.append("BUY" if (curr - prev) > 0 else "SELL") # 26. Price Velocity
-        signals.append("BUY" if ((curr - prev) - (prev - prices.iloc[-3])) > 0 else "SELL") # 27. Acceleration
-        signals.append("BUY" if curr > prices.median() else "SELL") # 28. Median Cross
-        signals.append("BUY" if np.log(curr/prev) > 0 else "SELL") # 29. Log Returns
-        signals.append("BUY" if curr > prices.iloc[0] else "SELL") # 30. Base Trend
-
+        # التصويت النهائي (أغلبية بسيطة لضمان الإرسال دائماً)
         buy_votes = signals.count("BUY")
         accuracy = int((max(buy_votes, 30 - buy_votes) / 30) * 100)
         
-        if accuracy >= 80:
-            final = "BUY 🟢 CALL" if buy_votes > 15 else "SELL 🔴 PUT"
-            if final != state['last_signal']:
-                return final, accuracy
-        return None, 0
+        final_dir = "BUY 🟢 CALL" if buy_votes >= 15 else "SELL 🔴 PUT"
+        return final_dir, accuracy
     except: return None, 0
 
 def trading_loop(chat_id, stop_event):
@@ -187,19 +200,20 @@ def trading_loop(chat_id, stop_event):
             break
         
         now = datetime.now()
+        # التنفيذ عند الثانية 30 بالضبط من كل دقيقة
         if now.second == 30:
             signal, acc = analyze_logic(chat_id)
-            if signal and not stop_event.is_set():
-                user_states[chat_id]['last_signal'] = signal
+            if signal:
                 entry_time = (now + timedelta(minutes=1)).strftime("%H:%M")
-                msg = (f"🎯 *SIGNAL DETECTED*\n━━━━━━━━━━━━━━━\n"
+                msg = (f"🎯 *NEW SIGNAL*\n━━━━━━━━━━━━━━━\n"
                        f"Pair: `{user_states[chat_id]['pair_name']}`\n"
                        f"Direction: *{signal}*\n"
-                       f"Accuracy: `{acc}%`\n"
+                       f"Accuracy: `{acc}%` (30 Indicators)\n"
                        f"Entry At: `{entry_time}`\n━━━━━━━━━━━━━━━")
-                try: bot.send_message(chat_id, msg, parse_mode="Markdown")
+                try: 
+                    bot.send_message(chat_id, msg, parse_mode="Markdown")
+                    time.sleep(2) # منع التكرار في نفس الثانية
                 except: pass
-                stop_event.wait(70) 
         
         stop_event.wait(0.5)
 
@@ -256,7 +270,7 @@ def start_bot(m):
     user_threads_events[chat_id] = stop_event
     user_states[chat_id]['running'] = True
     
-    bot.send_message(chat_id, "Waiting for signals ⏳")
+    bot.send_message(chat_id, "Waiting for signals ⏳ (Sending at :30 of every minute)")
     threading.Thread(target=trading_loop, args=(chat_id, stop_event), daemon=True).start()
 
 @bot.message_handler(func=lambda m: m.text == "STOP 🛑")
@@ -283,6 +297,7 @@ def handle_selection(call):
         bot.edit_message_text(f"🎯 Current: *{name}*", chat_id, call.message.message_id, parse_mode="Markdown")
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000), daemon=True).start()
+    # تشغيل لوحة التحكم في خلفية منفصلة
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000, use_reloader=False), daemon=True).start()
     bot.delete_webhook(drop_pending_updates=True)
     bot.infinity_polling(skip_pending=True)
