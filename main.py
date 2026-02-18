@@ -10,8 +10,8 @@ import time
 from flask import Flask, render_template_string, request, redirect
 from pymongo import MongoClient
 
-# ================= CONFIG (التوكن والإعدادات) =================
-BOT_TOKEN = "8264292822:AAFBR4WAQ0-MIuQM0LxXKV-wjBypSEyuHV8"
+# ================= CONFIG (التوكن الجديد والإعدادات) =================
+BOT_TOKEN = "8264292822:AAHQMH36c2EGhxXIfxEk0TDrA-rZNMy2hxE"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
 
@@ -71,46 +71,39 @@ def delete_user(email):
     users_col.delete_one({"email": email})
     return redirect("/")
 
-# ================= TRADING LOGIC (30 INDICATORS + 110 TICKS CONDITION) =================
+# ================= TRADING LOGIC =================
 def analyze_logic(chat_id):
     state = user_states.get(chat_id)
     if not state: return None, 0
     try:
         ws = websocket.create_connection(WS_URL, timeout=15)
-        # جلب 3500 تيك كما طلبت
         ws.send(json.dumps({"ticks_history": state['pair'], "count": 3500, "end": "latest", "style": "ticks"}))
         res = json.loads(ws.recv())
         ws.close()
         
         ticks = res.get("history", {}).get("prices", [])
-        if len(ticks) < 110: return None, 0
+        if len(ticks) < 55: return None, 0
 
-        # --- شرط الـ 110 تيك ---
-        # BUY: أول 60 هابطة (سعر 60 < سعر 1) وآخر 50 صاعدة (سعر 110 > سعر 61)
-        # SELL: أول 60 صاعدة (سعر 60 > سعر 1) وآخر 50 هابطة (سعر 110 < سعر 61)
-        last_110 = ticks[-110:]
-        first_60 = last_110[:60]
-        last_50 = last_110[60:]
+        last_55 = ticks[-55:]
+        first_30 = last_55[:30]
+        last_25 = last_55[30:]
 
-        is_buy_condition = (first_60[-1] < first_60[0]) and (last_50[-1] > last_50[0])
-        is_sell_condition = (first_60[-1] > first_60[0]) and (last_50[-1] < last_50[0])
+        is_buy_condition = (first_30[-1] < first_30[0]) and (last_25[-1] > last_25[0])
+        is_sell_condition = (first_30[-1] > first_30[0]) and (last_25[-1] < last_25[0])
 
         if not (is_buy_condition or is_sell_condition):
             return None, 0
 
-        # --- تحليل المؤشرات الـ 30 (شمعة = 60 تيك) ---
-        candle_data = [ticks[i:i+60][-1] for i in range(0, len(ticks), 60)]
+        candle_data = [ticks[i:i+30][-1] for i in range(0, len(ticks), 30)]
         prices = pd.Series(candle_data)
-        
         curr = prices.iloc[-1]
         prev = prices.iloc[-2]
         signals = []
 
-        # (نفس منطق الـ 30 مؤشر الخاص بك ولكن على بيانات الشموع الجديدة)
+        # 30 Indicators
         signals.append("BUY" if curr > prices.rolling(10).mean().iloc[-1] else "SELL")
         diff = prices.diff()
-        gain = diff.where(diff > 0, 0).rolling(7).mean()
-        loss = -diff.where(diff < 0, 0).rolling(7).mean()
+        gain = diff.where(diff > 0, 0).rolling(7).mean(); loss = -diff.where(diff < 0, 0).rolling(7).mean()
         rsi = 100 - (100 / (1 + (gain / (loss + 0.0000001)).iloc[-1]))
         signals.append("BUY" if rsi < 50 else "SELL")
         macd = prices.ewm(span=12).mean().iloc[-1] - prices.ewm(span=26).mean().iloc[-1]
@@ -118,8 +111,7 @@ def analyze_logic(chat_id):
         l_min, h_max = prices.rolling(10).min().iloc[-1], prices.rolling(10).max().iloc[-1]
         signals.append("BUY" if ((curr - l_min) / (h_max - l_min + 0.0000001)) * 100 > 50 else "SELL")
         signals.append("BUY" if ((h_max - curr) / (h_max - l_min + 0.0000001)) * -100 > -50 else "SELL")
-        tp = prices.rolling(10).mean().iloc[-1]
-        mad = prices.rolling(10).apply(lambda x: np.abs(x - x.mean()).mean()).iloc[-1]
+        tp = prices.rolling(10).mean().iloc[-1]; mad = prices.rolling(10).apply(lambda x: np.abs(x - x.mean()).mean()).iloc[-1]
         signals.append("BUY" if ((curr - tp) / (0.015 * mad + 0.0000001)) > 0 else "SELL")
         signals.append("BUY" if curr > prices.iloc[-5] else "SELL")
         signals.append("BUY" if ((curr - prices.iloc[-8]) / prices.iloc[-8]) > 0 else "SELL")
@@ -149,37 +141,30 @@ def analyze_logic(chat_id):
 
         buy_votes = signals.count("BUY")
         accuracy = int((max(buy_votes, 30 - buy_votes) / 30) * 100)
-        
-        # الإشارة تعتمد الآن على شرط الـ 110 تيك فقط
         final_dir = "BUY 🟢 CALL" if is_buy_condition else "SELL 🔴 PUT"
         return final_dir, accuracy
-
     except: return None, 0
 
 def trading_loop(chat_id, stop_event):
     while not stop_event.is_set():
         if chat_id not in user_states or not user_states[chat_id]['running']: break
-        
         now = datetime.now()
         if now.second == 30:
             signal, acc = analyze_logic(chat_id)
             if signal:
                 entry_time = (now + timedelta(minutes=1)).strftime("%H:%M")
-                msg = (f"🎯 *NEW SIGNAL (110 Ticks Pattern)*\n━━━━━━━━━━━━━━━\n"
+                msg = (f"🎯 *SIGNAL DETECTED*\n━━━━━━━━━━━━━━━\n"
                        f"Pair: `{user_states[chat_id]['pair_name']}`\n"
                        f"Direction: *{signal}*\n"
                        f"Accuracy: `{acc}%` 🔥\n"
-                       f"Candle: `60 Ticks`\n"
-                       f"Pattern: `60 Down / 50 Up` ✅\n"
                        f"Entry At: `{entry_time}`\n━━━━━━━━━━━━━━━")
                 try: 
                     bot.send_message(chat_id, msg, parse_mode="Markdown")
-                    time.sleep(70) 
+                    time.sleep(70)
                 except: pass
-        
         stop_event.wait(0.5)
 
-# ================= REST OF THE CODE (HANDLERS) =================
+# ================= TELEGRAM HANDLERS =================
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("START 🚀", "STOP 🛑")
@@ -209,7 +194,7 @@ def start_bot(m):
     stop_event = threading.Event()
     user_threads_events[chat_id] = stop_event
     user_states[chat_id]['running'] = True
-    bot.send_message(chat_id, "🚀 Running! (Pattern: 110 Ticks | Candle: 60 Ticks)")
+    bot.send_message(chat_id, "🚀 Running!", reply_markup=main_menu())
     threading.Thread(target=trading_loop, args=(chat_id, stop_event), daemon=True).start()
 
 @bot.message_handler(func=lambda m: m.text == "STOP 🛑")
