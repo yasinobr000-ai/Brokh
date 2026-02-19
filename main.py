@@ -11,7 +11,7 @@ from flask import Flask, render_template_string, request, redirect
 from pymongo import MongoClient
 
 # ================= CONFIG (التوكن والإعدادات) =================
-BOT_TOKEN = "8264292822:AAHGzqw8R7rpEcuGlIkXb0hs7LUWFQiLwkU"
+BOT_TOKEN = "8264292822:AAEMIUtoYXQb8_9mlDNpNgMp207h2ZdL2Ds"
 MONGO_URI = "mongodb+srv://charbelnk111_db_user:Mano123mano@cluster0.2gzqkc8.mongodb.net/?appName=Cluster0"
 WS_URL = "wss://blue.derivws.com/websockets/v3?app_id=16929"
 
@@ -26,10 +26,11 @@ user_states = {}
 user_threads_events = {}
 
 FOREX_PAIRS = {
-    "EUR/USD": "frxEURUSD", "GBP/USD": "frxGBPUSD", "USD/JPY": "frxUSDJPY",
-    "EUR/GBP": "frxEURGBP", "AUD/USD": "frxAUDUSD", "USD/CHF": "frxUSDCHF",
-    "USD/CAD": "frxUSDCAD", "NZD/USD": "frxNZDUSD", "EUR/JPY": "frxEURJPY",
-    "GBP/JPY": "frxGBPJPY", "Gold/USD": "frxXAUUSD", "volatility 100": "R_100"
+    "Volatility_100": "R_100", 
+    "EUR/USD": "frxEURUSD", 
+    "GBP/USD": "frxGBPUSD", 
+    "USD/JPY": "frxUSDJPY",
+    "Gold/USD": "frxXAUUSD"
 }
 
 # ================= دالة حذف الرسالة تلقائياً =================
